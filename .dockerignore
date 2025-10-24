@@ -1,0 +1,10 @@
+bin/
+obj/
+**/*.pdb
+**/*.user
+**/*.suo
+*.git
+.git/
+.gitignore
+Dockerfile
+README.md
