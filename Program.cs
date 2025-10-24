@@ -6,13 +6,10 @@ using System.Net.Mail;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
-
-// Alias para evitar conflicto con System.ComponentModel.License
-using PL = Portable.Licensing;
+using PL = Portable.Licensing; // Alias para evitar conflicto con System.ComponentModel.License
 
 const string PRODUCT_CODE = "EARTH";
 
@@ -49,7 +46,6 @@ var map = new Dictionary<long, (int weeks, int months, string version, bool comm
 
 // ========== Store en memoria para “claims” ==========
 var claims = new ConcurrentDictionary<string, ClaimState>();
-
 static string ClaimKey(string orderId, string email) => $"{orderId}::{email}".ToLowerInvariant();
 
 // Limpieza básica (evita acumular en memoria)
@@ -57,8 +53,13 @@ using var cleanupTimer = new System.Threading.Timer(_ =>
 {
     var cutoff = DateTime.UtcNow.AddHours(-12);
     foreach (var kv in claims)
+    {
         if (kv.Value.Claim.CreatedUtc < cutoff)
-            claims.TryRemove(kv.Key, out _);
+        {
+            // EXPRESO el tipo para evitar el "out object"
+            claims.TryRemove(kv.Key, out ClaimState _discard);
+        }
+    }
 }, null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
 
 // ========== App ==========
@@ -68,9 +69,7 @@ var app = builder.Build();
 var portEnv = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Urls.Add($"http://0.0.0.0:{portEnv}");
 
-// Salud
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
-
 app.MapGet("/", () => "EarthLicServer OK");
 
 // -------- Licencia de prueba: 7 días ----------
@@ -92,8 +91,11 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
     string body = await new StreamReader(req.Body).ReadToEndAsync();
 
+    // toma la firma de forma segura como string (puede venir ausente)
+    var headerSig = req.Headers.TryGetValue("X-Signature", out var sv) ? sv.ToString() : "";
+
     // Verifica HMAC si hay secreto cargado
-    if (!VerifyHmac(body, lsSecret, req.Headers["X-Signature"]))
+    if (!VerifyHmac(body, lsSecret, headerSig))
     {
         Console.WriteLine("[Webhook] Firma inválida");
         return Results.Unauthorized();
@@ -182,7 +184,6 @@ app.MapGet("/claim", (HttpRequest req) =>
     byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
     string fileName = $"earth-{state.Claim.Version}-{state.Claim.Email.Replace("@","_")}.lic";
 
-    // fuerza descarga
     return Results.File(
         fileContents: bytes,
         contentType: "application/octet-stream",
@@ -233,7 +234,7 @@ static string? Get(JsonElement root, string path)
 
 static bool VerifyHmac(string body, string secret, string headerSig)
 {
-    if (string.IsNullOrWhiteSpace(secret)) return true;   // útil en pruebas
+    if (string.IsNullOrWhiteSpace(secret)) return true; // útil en pruebas
     if (string.IsNullOrWhiteSpace(headerSig)) return false;
 
     using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
@@ -256,8 +257,7 @@ void TrySendMail(string to, string subject, string text, PL.License lic)
     catch (Exception ex) { Console.WriteLine("SMTP error: " + ex.Message); }
 }
 
-// ========= Tipos: van al FINAL del archivo =========
-
+// ========= Tipos: al FINAL =========
 record Claim(
     string OrderId,
     string Email,
