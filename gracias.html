@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<title>Gracias por tu compra</title>
+<body style="font-family:system-ui;max-width:640px;margin:40px auto">
+  <h1>¡Gracias por tu compra!</h1>
+  <p id="msg">Preparando tu licencia…</p>
+  <button id="btn" disabled>Descargar licencia</button>
+
+<script>
+const API = "https://earth-lic-server.onrender.com"; // tu server
+const params = new URLSearchParams(location.search);
+const order_id = params.get("order_id");
+const email    = params.get("email");
+
+const $msg = document.getElementById("msg");
+const $btn = document.getElementById("btn");
+
+async function checkReady() {
+  const url = `${API}/claim/status?order_id=${encodeURIComponent(order_id)}&email=${encodeURIComponent(email)}`;
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const j = await r.json();
+    if (j.ready) {
+      $msg.textContent = "Tu licencia está lista.";
+      $btn.disabled = false;
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+$btn.addEventListener("click", () => {
+  const url = `${API}/claim?order_id=${encodeURIComponent(order_id)}&email=${encodeURIComponent(email)}`;
+  // Fuerza descarga
+  window.location.href = url;
+});
+
+// Polling suave: intenta por ~30s
+let tries = 0;
+(async function poll(){
+  if (!order_id || !email) {
+    $msg.textContent = "Faltan datos del pedido. Revisa tu correo.";
+    return;
+  }
+  if (await checkReady()) return;
+  tries++;
+  if (tries < 15) setTimeout(poll, 2000);
+  else $msg.textContent = "Aún no llega la confirmación. Actualiza esta página en unos segundos o revisa tu correo.";
+})();
+</script>
+</body>
+</html>
