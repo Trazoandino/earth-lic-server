@@ -23,7 +23,7 @@ const string PRODUCT_CODE = "EARTH";
 // Opción A (recomendada): variable de entorno PRIVATE_KEY_PEM con el PEM completo
 string? pem = Environment.GetEnvironmentVariable("PRIVATE_KEY_PEM");
 
-// Opción B: ruta a archivo en PRIVATE_KEY_PATH (ej: C:\keys\private.key)
+// Opción B: ruta a archivo en PRIVATE_KEY_PATH (ej: /etc/secrets/private.key en Render)
 string privatePem = pem ?? File.ReadAllText(Environment.GetEnvironmentVariable("PRIVATE_KEY_PATH") ?? "private.key");
 
 // Pass/phrase con la que se generó la privada
@@ -65,9 +65,13 @@ var app = builder.Build();
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Urls.Add($"http://0.0.0.0:{port}");
 
+// --- Health check (para Render) ---
+app.MapGet("/healthz", () => Results.Ok("ok"));
+
+// --- Ping rápido ---
 app.MapGet("/", () => "EarthLicServer OK");
 
-// -------- Licencia de prueba: 7 días ----------
+// --- Licencia de prueba: 7 días ---
 app.MapGet("/trial", (HttpRequest req) =>
 {
     string email = req.Query["email"].ToString();
@@ -81,7 +85,7 @@ app.MapGet("/trial", (HttpRequest req) =>
     return Results.File(bytes, "text/plain", $"earth-{version}-trial.lic");
 });
 
-// -------- Webhook de Lemon: order_created ----------
+// --- Webhook de Lemon: order_created ---
 app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
     using var rdr = new StreamReader(req.Body);
@@ -98,7 +102,7 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 
     long variantId = long.Parse(Get(doc.RootElement, "data.attributes.variant_id") ?? "0");
     string email = Get(doc.RootElement, "data.attributes.user_email") ?? "cliente@correo";
-    string name = Get(doc.RootElement, "data.attributes.user_name") ?? "Cliente";
+    string name  = Get(doc.RootElement, "data.attributes.user_name")  ?? "Cliente";
 
     if (!map.TryGetValue(variantId, out var cfg))
         return Results.BadRequest($"Variant {variantId} no mapeada");
@@ -154,8 +158,8 @@ static string? Get(JsonElement root, string path)
     {
         JsonValueKind.String => cur.GetString(),
         JsonValueKind.Number => cur.GetRawText(),
-        JsonValueKind.True => "true",
-        JsonValueKind.False => "false",
+        JsonValueKind.True   => "true",
+        JsonValueKind.False  => "false",
         _ => cur.GetRawText()
     };
 }
