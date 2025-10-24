@@ -1,14 +1,12 @@
-// Program.cs  (EarthLicServer – .NET 8, Minimal API)
+// Program.cs  (EarthLicServer - .NET 8, Minimal API)
 // Requiere: Microsoft.NET.Sdk.Web y referencia local a libs/Portable.Licensing.dll (v1.1.0)
 
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
 using System.Net.Mail;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
@@ -18,70 +16,84 @@ using PL = Portable.Licensing;
 
 const string PRODUCT_CODE = "EARTH";
 
-// ================== SECRETS / ENTORNO ==================
-
+// ================== Config / secretos ==================
 string? pem = Environment.GetEnvironmentVariable("PRIVATE_KEY_PEM");
 string privatePem = pem ?? File.ReadAllText(Environment.GetEnvironmentVariable("PRIVATE_KEY_PATH") ?? "private.key");
 string privatePass = Environment.GetEnvironmentVariable("PRIVATE_KEY_PASS") ?? "change-me";
 
+// Webhook secret de Lemon (Settings → Webhooks)
 string lsSecret = Environment.GetEnvironmentVariable("LS_WEBHOOK_SECRET") ?? "";
 
-// SMTP opcional
+// SMTP opcional (para enviar por correo)
 string smtpHost = Environment.GetEnvironmentVariable("SMTP_HOST") ?? "";
 int smtpPort = int.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"), out var p) ? p : 587;
 string smtpUser = Environment.GetEnvironmentVariable("SMTP_USER") ?? "";
 string smtpPass = Environment.GetEnvironmentVariable("SMTP_PASS") ?? "";
 string fromMail = Environment.GetEnvironmentVariable("FROM_MAIL") ?? "licencias@tu-dominio.com";
 
-// ================== MAPEO VARIANTS ==================
-
+// ========== Mapeo Variant → (semanas, meses, version, community) ==========
 var map = new Dictionary<long, (int weeks, int months, string version, bool community)>
 {
-    // 2025
-    { 1051443, (0,  3, "2025", false) },
-    { 1051506, (0,  6, "2025", false) },
-    { 1052828, (0, 12, "2025", false) },
-    // 2023
-    { 1052829, (0,  3, "2023", false) },
-    { 1052830, (0,  6, "2023", false) },
-    { 1052840, (0, 12, "2023", false) },
-    // Comunidad (sin expiración)
-    { 1053345, (0,  0, "2023", true ) },
-    { 1053346, (0,  0, "2025", true ) },
+    // Revit 2025
+    { 1051443, (0,  3, "2025", false) }, // 3 meses
+    { 1051506, (0,  6, "2025", false) }, // 6 meses
+    { 1052828, (0, 12, "2025", false) }, // 1 año
+    // Revit 2023
+    { 1052829, (0,  3, "2023", false) }, // 3 meses
+    { 1052830, (0,  6, "2023", false) }, // 6 meses
+    { 1052840, (0, 12, "2023", false) }, // 1 año
+    // Comunidad
+    { 1053345, (0,  0, "2023", true)  }, // Libre Comunidad 2023
+    { 1053346, (0,  0, "2025", true)  }, // Libre Comunidad 2025
 };
 
-// ================== “CLAIMS” EN MEMORIA (PROTO) ==================
+// ========== Store en memoria para “claims” ==========
+record Claim(
+    string OrderId,
+    string Email,
+    string Name,
+    long VariantId,
+    string Version,
+    bool Community,
+    int Weeks,
+    int Months,
+    int Days,
+    DateTime CreatedUtc);
 
-var claims = new ConcurrentDictionary<string, ClaimEntry>();
-
-record ClaimEntry(string Email, byte[] Bytes, DateTime ReadyAtUtc, DateTime ExpiresAtUtc, int MaxDownloads);
-
-// Limpieza simple cada 10 min
-var cleaner = new System.Timers.Timer(1000 * 60 * 10);
-cleaner.Elapsed += (_, __) =>
+class ClaimState
 {
+    public Claim Claim { get; init; }
+    public bool Ready { get; set; }
+    public string? LicenseText { get; set; }
+    public ClaimState(Claim c) { Claim = c; }
+}
+
+static string ClaimKey(string orderId, string email) => $"{orderId}::{email}".ToLowerInvariant();
+
+var claims = new ConcurrentDictionary<string, ClaimState>();
+
+// Limpieza básica (evita acumular en memoria)
+using var cleanupTimer = new System.Threading.Timer(_ =>
+{
+    var cutoff = DateTime.UtcNow.AddHours(-12);
     foreach (var kv in claims)
-        if (kv.Value.ExpiresAtUtc <= DateTime.UtcNow)
+        if (kv.Value.Claim.CreatedUtc < cutoff)
             claims.TryRemove(kv.Key, out _);
-};
-cleaner.AutoReset = true;
-cleaner.Start();
+}, null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
 
-// ================== APP ==================
-
+// ========== App ==========
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
 var portEnv = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Urls.Add($"http://0.0.0.0:{portEnv}");
 
-// Health
+// Salud
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
 
-// Root
 app.MapGet("/", () => "EarthLicServer OK");
 
-// Trial 7 días
+// -------- Licencia de prueba: 7 días ----------
 app.MapGet("/trial", (HttpRequest req) =>
 {
     string email = req.Query["email"].ToString();
@@ -90,120 +102,121 @@ app.MapGet("/trial", (HttpRequest req) =>
     string version = req.Query["version"].ToString();
     if (string.IsNullOrWhiteSpace(version)) version = "2025";
 
-    var lic = BuildLicense("Trial", email, weeks: 0, months: 0, days: 7, version, community: false);
+    var lic = BuildLicense("Trial", email, 0, 0, 7, version, community: false);
     var bytes = Encoding.UTF8.GetBytes(lic.ToString());
     return Results.File(bytes, "text/plain", $"earth-{version}-trial.lic");
 });
 
-// ===== Webhook Lemon: order_created -> genera y almacena claim =====
+// -------- Webhook de Lemon: order_created ----------
 app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
-    using var rdr = new StreamReader(req.Body);
-    var body = await rdr.ReadToEndAsync();
+    string body = await new StreamReader(req.Body).ReadToEndAsync();
 
-    // Acepta X-Signature (normalmente minúscula en headers)
-    var sig = req.Headers["X-Signature"].ToString();
-    if (string.IsNullOrEmpty(sig))
-        sig = req.Headers["x-signature"].ToString();
-
-    if (!VerifyHmac(body, lsSecret, sig))
+    // Verifica HMAC si hay secreto cargado
+    if (!VerifyHmac(body, lsSecret, req.Headers["X-Signature"]))
+    {
+        Console.WriteLine("[Webhook] Firma inválida");
         return Results.Unauthorized();
+    }
 
     using var doc = JsonDocument.Parse(body);
-    string eventName = Get(doc.RootElement, "meta.event_name") ?? "";
-    if (!string.Equals(eventName, "order_created", StringComparison.OrdinalIgnoreCase))
-        return Results.Ok("ignored");
+    var root = doc.RootElement;
 
-    // Datos principales del pedido
-    long variantId = long.Parse(Get(doc.RootElement, "data.attributes.variant_id") ?? "0");
-    string email = Get(doc.RootElement, "data.attributes.user_email") ?? "cliente@correo";
-    string name = Get(doc.RootElement, "data.attributes.user_name") ?? "Cliente";
+    var eventName = Get(root, "meta.event_name") ?? "";
+    Console.WriteLine($"[Webhook] event = {eventName}");
+
+    if (!string.Equals(eventName, "order_created", StringComparison.OrdinalIgnoreCase))
+        return Results.Ok(new { ignored = eventName });
+
+    // Datos claves
+    long variantId = long.Parse(Get(root, "data.attributes.variant_id") ?? "0");
+    string orderId  = Get(root, "data.id") 
+                      ?? Get(root, "data.attributes.order_number") 
+                      ?? Guid.NewGuid().ToString("N");
+
+    string email = Get(root, "data.attributes.user_email") ?? "cliente@correo";
+    string name  = Get(root, "data.attributes.user_name")  ?? "Cliente";
 
     if (!map.TryGetValue(variantId, out var cfg))
-        return Results.BadRequest($"Variant {variantId} no mapeada");
+    {
+        Console.WriteLine($"[Webhook] Variant {variantId} NO mapeada");
+        return Results.BadRequest(new { error = "variant_not_mapped", variantId });
+    }
 
-    var lic = BuildLicense(name, email, cfg.weeks, cfg.months, 0, cfg.version, cfg.community);
-    var licBytes = Encoding.UTF8.GetBytes(lic.ToString());
-
-    // OrderId robusto (prueba varias rutas del payload)
-    string orderId = Get(doc.RootElement, "data.id")
-                  ?? Get(doc.RootElement, "data.attributes.order_id")
-                  ?? Get(doc.RootElement, "meta.custom_data.order_id")
-                  ?? Guid.NewGuid().ToString();
-
-    claims[orderId] = new ClaimEntry(
-        Email: email,
-        Bytes: licBytes,
-        ReadyAtUtc: DateTime.UtcNow,
-        ExpiresAtUtc: DateTime.UtcNow.AddDays(7),
-        MaxDownloads: 3
+    var claim = new Claim(
+        OrderId:  orderId,
+        Email:    email,
+        Name:     name,
+        VariantId:variantId,
+        Version:  cfg.version,
+        Community:cfg.community,
+        Weeks:    cfg.weeks,
+        Months:   cfg.months,
+        Days:     0,
+        CreatedUtc: DateTime.UtcNow
     );
 
-    // (Opcional) Enviar también por correo
-    // TrySendMail(email, $"Licencia Earth Revit {cfg.version}",
-    //     "Adjuntamos tu licencia. Guárdala en C:\\ProgramData\\Estuche\\license.lic y abre Revit.",
-    //     lic);
+    var state = claims.GetOrAdd(ClaimKey(orderId, email), _ => new ClaimState(claim));
 
-    Console.WriteLine($"[WEBHOOK] OK {email} -> {cfg.version} {cfg.months}m/{cfg.weeks}w community={cfg.community} orderId={orderId}");
+    // Genera licencia y marca lista
+    var lic = BuildLicense(name, email, cfg.weeks, cfg.months, 0, cfg.version, cfg.community);
+    state.LicenseText = lic.ToString();
+    state.Ready = true;
+
+    Console.WriteLine($"[Webhook] READY order={orderId} email={email} ver={cfg.version} months={cfg.months} community={cfg.community}");
+
+    // (Opcional) correo con adjunto
+    TrySendMail(email, $"Licencia Earth Revit {cfg.version}",
+        "Adjuntamos tu licencia. Guárdala en C:\\ProgramData\\Estuche\\license.lic y abre Revit.",
+        lic);
+
     return Results.Ok(new { ok = true });
 });
 
-// ===== Reclamo: descarga licencia si ya está lista =====
-// GET /claim?order_id=...&email=...
-app.MapGet("/claim", (HttpRequest req) =>
-{
-    var orderId = req.Query["order_id"].ToString();
-    var email   = req.Query["email"].ToString();
-
-    if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
-        return Results.BadRequest("Faltan parámetros: order_id y email");
-
-    if (!claims.TryGetValue(orderId, out var entry))
-        return Results.NotFound(new { ready = false, msg = "Aún no recibimos tu pago (webhook). Reintenta en unos segundos." });
-
-    if (!string.Equals(entry.Email, email, StringComparison.OrdinalIgnoreCase))
-        return Results.Unauthorized();
-
-    if (entry.ExpiresAtUtc <= DateTime.UtcNow)
-    {
-        claims.TryRemove(orderId, out _);
-        return Results.StatusCode(410); // expiró
-    }
-
-    if (entry.MaxDownloads <= 0)
-        return Results.StatusCode(429); // demasiadas descargas
-
-    // Decrementa contador y entrega
-    claims[orderId] = entry with { MaxDownloads = entry.MaxDownloads - 1 };
-    return Results.File(entry.Bytes, "application/octet-stream", "license.lic");
-});
-
-// ===== Estado: para “polling” en tu página de Gracias =====
-// GET /claim/status?order_id=...&email=...
+// -------- Polling desde gracias.html --------
 app.MapGet("/claim/status", (HttpRequest req) =>
 {
-    var orderId = req.Query["order_id"].ToString();
-    var email   = req.Query["email"].ToString();
+    string orderId = req.Query["order_id"].ToString() ?? "";
+    string email   = req.Query["email"].ToString() ?? "";
 
     if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
-        return Results.BadRequest(new { ready = false, msg = "Faltan parámetros" });
+        return Results.BadRequest(new { ready = false, error = "missing_params" });
 
-    if (!claims.TryGetValue(orderId, out var entry))
-        return Results.Ok(new { ready = false });
+    if (claims.TryGetValue(ClaimKey(orderId, email), out var state))
+        return Results.Ok(new { ready = state.Ready });
 
-    var ok = string.Equals(entry.Email, email, StringComparison.OrdinalIgnoreCase)
-             && entry.ExpiresAtUtc > DateTime.UtcNow;
+    return Results.Ok(new { ready = false });
+});
 
-    return Results.Ok(new { ready = ok });
+app.MapGet("/claim", (HttpRequest req) =>
+{
+    string orderId = req.Query["order_id"].ToString() ?? "";
+    string email   = req.Query["email"].ToString() ?? "";
+
+    if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
+        return Results.BadRequest(new { error = "missing_params" });
+
+    if (!claims.TryGetValue(ClaimKey(orderId, email), out var state) || !state.Ready || string.IsNullOrEmpty(state.LicenseText))
+        return Results.NotFound(new { error = "not_ready" });
+
+    byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
+    string fileName = $"earth-{state.Claim.Version}-{state.Claim.Email.Replace("@","_")}.lic";
+
+    // fuerza descarga
+    return Results.File(
+        fileContents: bytes,
+        contentType: "application/octet-stream",
+        fileDownloadName: fileName,
+        enableRangeProcessing: false);
 });
 
 app.Run();
 
-// ================== HELPERS ==================
+// ================= Helpers =================
 
 PL.License BuildLicense(string name, string email, int weeks, int months, int days, string version, bool community)
 {
-    var l = PL.License.New()
+    var lic = PL.License.New()
         .WithUniqueIdentifier(Guid.NewGuid())
         .As(PL.LicenseType.Standard)
         .WithProductFeatures(new Dictionary<string, string> {
@@ -216,10 +229,10 @@ PL.License BuildLicense(string name, string email, int weeks, int months, int da
     if (!community)
     {
         DateTime expires = DateTime.UtcNow.AddDays(days + weeks * 7).AddMonths(months);
-        l = l.ExpiresAt(expires);
+        lic = lic.ExpiresAt(expires);
     }
 
-    return l.CreateAndSignWithPrivateKey(privatePem, privatePass);
+    return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
 }
 
 static string? Get(JsonElement root, string path)
@@ -232,21 +245,20 @@ static string? Get(JsonElement root, string path)
     {
         JsonValueKind.String => cur.GetString(),
         JsonValueKind.Number => cur.GetRawText(),
-        JsonValueKind.True => "true",
-        JsonValueKind.False => "false",
+        JsonValueKind.True   => "true",
+        JsonValueKind.False  => "false",
         _ => cur.GetRawText()
     };
 }
 
 static bool VerifyHmac(string body, string secret, string headerSig)
 {
-    if (string.IsNullOrWhiteSpace(secret)) return true; // en pruebas
+    if (string.IsNullOrWhiteSpace(secret)) return true;   // útil en pruebas
     if (string.IsNullOrWhiteSpace(headerSig)) return false;
 
     using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
     var hex = BitConverter.ToString(h.ComputeHash(Encoding.UTF8.GetBytes(body)))
-        .Replace("-", "").ToLowerInvariant();
-
+                         .Replace("-", "").ToLowerInvariant();
     return string.Equals(hex, headerSig, StringComparison.OrdinalIgnoreCase);
 }
 
