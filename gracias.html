@@ -1,53 +1,112 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
-<meta charset="utf-8">
-<title>Gracias por tu compra</title>
-<body style="font-family:system-ui;max-width:640px;margin:40px auto">
-  <h1>¡Gracias por tu compra!</h1>
-  <p id="msg">Preparando tu licencia…</p>
-  <button id="btn" disabled>Descargar licencia</button>
-
-<script>
-const API = "https://earth-lic-server.onrender.com"; // tu server
-const params = new URLSearchParams(location.search);
-const order_id = params.get("order_id");
-const email    = params.get("email");
-
-const $msg = document.getElementById("msg");
-const $btn = document.getElementById("btn");
-
-async function checkReady() {
-  const url = `${API}/claim/status?order_id=${encodeURIComponent(order_id)}&email=${encodeURIComponent(email)}`;
-  try {
-    const r = await fetch(url, { cache: "no-store" });
-    const j = await r.json();
-    if (j.ready) {
-      $msg.textContent = "Tu licencia está lista.";
-      $btn.disabled = false;
-      return true;
+<head>
+  <meta charset="UTF-8" />
+  <title>¡Gracias por tu compra!</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 600px;
+      margin: 3rem auto;
+      line-height: 1.5;
     }
-  } catch {}
-  return false;
-}
+    h1 { font-size: 2rem; margin-bottom: 1rem; }
+    #statusMsg { margin-bottom: 1rem; }
+    #downloadBtn[disabled] {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #downloadBtn {
+      font-size: 1rem;
+      padding: .6rem 1rem;
+    }
+  </style>
+</head>
+<body>
 
-$btn.addEventListener("click", () => {
-  const url = `${API}/claim?order_id=${encodeURIComponent(order_id)}&email=${encodeURIComponent(email)}`;
-  // Fuerza descarga
-  window.location.href = url;
-});
+  <h1>¡Gracias por tu compra!</h1>
 
-// Polling suave: intenta por ~30s
-let tries = 0;
-(async function poll(){
-  if (!order_id || !email) {
-    $msg.textContent = "Faltan datos del pedido. Revisa tu correo.";
-    return;
-  }
-  if (await checkReady()) return;
-  tries++;
-  if (tries < 15) setTimeout(poll, 2000);
-  else $msg.textContent = "Aún no llega la confirmación. Actualiza esta página en unos segundos o revisa tu correo.";
-})();
-</script>
+  <p id="statusMsg">Preparando tu licencia...</p>
+
+  <button id="downloadBtn" disabled>Descargar licencia</button>
+
+  <script>
+  (async function () {
+    // 1. Tomar los datos que nos mandó Lemon Squeezy en la URL
+    const params = new URLSearchParams(window.location.search);
+
+    const orderId = params.get("order_id"); // ej: "2340801"
+    const email   = params.get("email");    // ej: "cliente@algo.com"
+
+    const statusMsg   = document.getElementById("statusMsg");
+    const downloadBtn = document.getElementById("downloadBtn");
+
+    // helpers
+    function noData() {
+      statusMsg.textContent =
+        "Faltan datos del pedido. Revisa tu correo.";
+      downloadBtn.disabled = true;
+    }
+
+    // si no tenemos datos críticos, avisamos y salimos
+    if (!orderId || !email) {
+      noData();
+      return;
+    }
+
+    // 2. URLs de tu API en Render
+    const API_BASE = "https://earth-lic-server.onrender.com";
+
+    const statusURL   = `${API_BASE}/claim/status?order_id=${encodeURIComponent(orderId)}&email=${encodeURIComponent(email)}`;
+    const claimURL    = `${API_BASE}/claim?order_id=${encodeURIComponent(orderId)}&email=${encodeURIComponent(email)}`;
+    const wakeURL     = `${API_BASE}/wake`;
+
+    // 3. Despertar Render en background para evitar la pantalla negra de "waking up"
+    //    (no esperamos la respuesta, solo disparamos)
+    fetch(wakeURL).catch(()=>{ /* ignore */ });
+
+    statusMsg.textContent = "Generando tu licencia...";
+
+    // 4. Polling: preguntamos cada 2s si la licencia ya está lista
+    const POLL_MS = 2000;
+
+    async function checkStatus() {
+      try {
+        const res = await fetch(statusURL, {
+          cache: "no-store",
+        });
+
+        if (!res.ok) {
+          // El server respondió algo tipo 400/404/500, todavía nada
+          return;
+        }
+
+        const data = await res.json();
+        // data = { ready: true/false }
+        if (data.ready) {
+          // listo!
+          statusMsg.textContent =
+            "Tu licencia está lista. Descárgala y colócala en C:\\ProgramData\\Estuche\\license.lic";
+
+          downloadBtn.disabled = false;
+          downloadBtn.onclick = () => {
+            // Navegamos directo a /claim => eso fuerza la descarga del archivo license.lic
+            window.location.href = claimURL;
+          };
+
+          clearInterval(timer);
+        }
+      } catch (err) {
+        // silencio: puede ser que el server siga despertando
+      }
+    }
+
+    // arrancamos el polling
+    const timer = setInterval(checkStatus, POLL_MS);
+    // y disparamos uno inmediato para no esperar 2s la primera vez
+    checkStatus();
+  })();
+  </script>
+
 </body>
 </html>
