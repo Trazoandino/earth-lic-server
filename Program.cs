@@ -6,9 +6,11 @@ using System.Net.Mail;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection; // <-- necesario para AddCors
 
 // Alias para evitar conflicto con System.ComponentModel.License
 using PL = Portable.Licensing;
@@ -16,6 +18,8 @@ using PL = Portable.Licensing;
 const string PRODUCT_CODE = "EARTH";
 
 // ================== Config / secretos ==================
+
+// Clave privada para firmar licencias
 string? pem = Environment.GetEnvironmentVariable("PRIVATE_KEY_PEM");
 string privatePem = pem ?? File.ReadAllText(Environment.GetEnvironmentVariable("PRIVATE_KEY_PATH") ?? "private.key");
 string privatePass = Environment.GetEnvironmentVariable("PRIVATE_KEY_PASS") ?? "change-me";
@@ -23,7 +27,7 @@ string privatePass = Environment.GetEnvironmentVariable("PRIVATE_KEY_PASS") ?? "
 // Webhook secret de Lemon (Settings → Webhooks)
 string lsSecret = Environment.GetEnvironmentVariable("LS_WEBHOOK_SECRET") ?? "";
 
-// SMTP opcional (para enviar por correo)
+// SMTP opcional (para enviar por correo la licencia al cliente)
 string smtpHost = Environment.GetEnvironmentVariable("SMTP_HOST") ?? "";
 int smtpPort = int.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"), out var p) ? p : 587;
 string smtpUser = Environment.GetEnvironmentVariable("SMTP_USER") ?? "";
@@ -31,37 +35,63 @@ string smtpPass = Environment.GetEnvironmentVariable("SMTP_PASS") ?? "";
 string fromMail = Environment.GetEnvironmentVariable("FROM_MAIL") ?? "licencias@tu-dominio.com";
 
 // ========== Mapeo Variant → (semanas, meses, version, community) ==========
+// OJO: estos Variant IDs deben ser los IDs reales de tus variantes en Lemon Squeezy
 var map = new Dictionary<long, (int weeks, int months, string version, bool community)>
 {
     // Revit 2025
     { 1051443, (0,  3, "2025", false) }, // 3 meses
     { 1051506, (0,  6, "2025", false) }, // 6 meses
     { 1052828, (0, 12, "2025", false) }, // 1 año
+
     // Revit 2023
     { 1052829, (0,  3, "2023", false) }, // 3 meses
     { 1052830, (0,  6, "2023", false) }, // 6 meses
     { 1052840, (0, 12, "2023", false) }, // 1 año
-    // Comunidad
+
+    // Comunidad / gratis
     { 1053345, (0,  0, "2023", true)  }, // Libre Comunidad 2023
     { 1053346, (0,  0, "2025", true)  }, // Libre Comunidad 2025
 };
 
 // ========== Store en memoria para “claims” ==========
+// Vamos a guardar temporalmente la licencia generada para cada compra,
+// indexada por orderId + email. Así la página gracias.html puede pedirla.
 var claims = new ConcurrentDictionary<string, ClaimState>();
 static string ClaimKey(string orderId, string email) => $"{orderId}::{email}".ToLowerInvariant();
 
-// Limpieza básica (evita acumular en memoria)
+// Limpieza básica (evita que se acumule memoria a lo loco)
 using var cleanupTimer = new System.Threading.Timer(_ =>
 {
     var cutoff = DateTime.UtcNow.AddHours(-12);
     foreach (var kv in claims)
+    {
         if (kv.Value.Claim.CreatedUtc < cutoff)
             claims.TryRemove(kv.Key, out ClaimState _);
+    }
 }, null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
 
-// ========== App ==========
+// ========== App / Hosting ==========
+
 var builder = WebApplication.CreateBuilder(args);
+
+// ---- CORS ----
+// Permitimos que la página gracias.html (hosteada en GitHub Pages) pueda hacer
+// fetch(...) al servidor en Render. Durante pruebas dejamos AllowAnyOrigin.
+// En producción puedes restringir con .WithOrigins("https://trazoandino.github.io")
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+        policy
+            .AllowAnyOrigin()
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+    );
+});
+
 var app = builder.Build();
+
+// habilita CORS
+app.UseCors();
 
 // Evita cachearse respuestas dinámicas (por si algún proxy mete mano)
 app.Use(async (ctx, next) =>
@@ -70,18 +100,24 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
+// Render te pasa el puerto en $PORT
 var portEnv = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Urls.Add($"http://0.0.0.0:{portEnv}");
 
-// Salud / ping / wake (útiles para precalentar)
+//
+// ---------- ENDPOINTS -----------
+//
+
+// Salud / ping / wake (útiles para testear y también para "despertar" la instancia desde gracias.html)
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
 app.MapGet("/ping",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
 app.MapGet("/wake",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
 
-// Raíz
+// Raíz (para ver que está vivo)
 app.MapGet("/", () => "EarthLicServer OK");
 
 // -------- Licencia de prueba (7 días) ----------
+// (Esta ruta es útil para debug / modo demo. El trial siempre expira en 7 días)
 app.MapGet("/trial", (HttpRequest req) =>
 {
     string email = req.Query["email"].ToString();
@@ -92,16 +128,20 @@ app.MapGet("/trial", (HttpRequest req) =>
 
     var lic = BuildLicense("Trial", email, 0, 0, 7, version, community: false);
     var bytes = Encoding.UTF8.GetBytes(lic.ToString());
+
     // Forzamos nombre license.lic para que el usuario solo mueva el archivo.
     return Results.File(bytes, "application/octet-stream", "license.lic");
 });
 
-// -------- Webhook de Lemon: order_created ----------
+// -------- Webhook de Lemon Squeezy: order_created ----------
+// Lemon Squeezy nos va a POSTear aquí cuando haya una orden nueva.
+// Nosotros generamos la licencia y la guardamos en memoria para que
+// gracias.html la pueda bajar.
 app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
     string body = await new StreamReader(req.Body).ReadToEndAsync();
 
-    // Firma HMAC
+    // Verifica firma HMAC del webhook si configuras el secret en Lemon
     var headerSig = req.Headers.TryGetValue("X-Signature", out var sv) ? sv.ToString() : "";
     if (!VerifyHmac(body, lsSecret, headerSig))
     {
@@ -114,14 +154,19 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 
     var eventName = Get(root, "meta.event_name") ?? "";
     Console.WriteLine($"[Webhook] event = {eventName}");
-    if (!string.Equals(eventName, "order_created", StringComparison.OrdinalIgnoreCase))
-        return Results.Ok(new { ignored = eventName });
 
-    // Datos claves del pedido
+    if (!string.Equals(eventName, "order_created", StringComparison.OrdinalIgnoreCase))
+    {
+        // ignoramos otros eventos
+        return Results.Ok(new { ignored = eventName });
+    }
+
+    // Extraer datos clave de la orden
     long variantId = long.Parse(Get(root, "data.attributes.variant_id") ?? "0");
-    string orderId  = Get(root, "data.id")
-                      ?? Get(root, "data.attributes.order_number")
-                      ?? Guid.NewGuid().ToString("N");
+
+    string orderId = Get(root, "data.id")
+                     ?? Get(root, "data.attributes.order_number")
+                     ?? Guid.NewGuid().ToString("N");
 
     string email = Get(root, "data.attributes.user_email") ?? "cliente@correo";
     string name  = Get(root, "data.attributes.user_name")  ?? "Cliente";
@@ -133,73 +178,109 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
     }
 
     var claim = new Claim(
-        OrderId:  orderId,
-        Email:    email,
-        Name:     name,
-        VariantId:variantId,
-        Version:  cfg.version,
-        Community:cfg.community,
-        Weeks:    cfg.weeks,
-        Months:   cfg.months,
-        Days:     0,
-        CreatedUtc: DateTime.UtcNow
+        OrderId:     orderId,
+        Email:       email,
+        Name:        name,
+        VariantId:   variantId,
+        Version:     cfg.version,
+        Community:   cfg.community,
+        Weeks:       cfg.weeks,
+        Months:      cfg.months,
+        Days:        0,
+        CreatedUtc:  DateTime.UtcNow
     );
 
+    // Creamos/actualizamos el estado en memoria
     var state = claims.GetOrAdd(ClaimKey(orderId, email), _ => new ClaimState(claim));
 
-    // Genera licencia y marca lista
-    var lic = BuildLicense(name, email, cfg.weeks, cfg.months, 0, cfg.version, cfg.community);
+    // Generar la licencia real firmada
+    var lic = BuildLicense(
+        name,
+        email,
+        cfg.weeks,
+        cfg.months,
+        0,
+        cfg.version,
+        cfg.community
+    );
+
+    // Guardamos para que /claim la pueda servir
     state.LicenseText = lic.ToString();
     state.Ready = true;
 
     Console.WriteLine($"[Webhook] READY order={orderId} email={email} ver={cfg.version} months={cfg.months} community={cfg.community}");
 
-    // (Opcional) correo con adjunto
-    TrySendMail(email, $"Licencia Earth Revit {cfg.version}",
+    // (Opcional) enviar por correo adjuntando la licencia
+    TrySendMail(
+        email,
+        $"Licencia Earth Revit {cfg.version}",
         "Adjuntamos tu licencia. Guárdala en C:\\ProgramData\\Estuche\\license.lic y abre Revit.",
-        lic);
+        lic
+    );
 
+    // Respondemos 200 OK al webhook
     return Results.Ok(new { ok = true });
 });
 
 // -------- Polling desde gracias.html --------
+// 1) /claim/status => para saber si la licencia ya está lista
 app.MapGet("/claim/status", (HttpRequest req) =>
 {
     string orderId = req.Query["order_id"].ToString() ?? "";
     string email   = req.Query["email"].ToString() ?? "";
 
     if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
+    {
         return Results.BadRequest(new { ready = false, error = "missing_params" });
+    }
 
     if (claims.TryGetValue(ClaimKey(orderId, email), out var state))
+    {
         return Results.Ok(new { ready = state.Ready });
+    }
 
     return Results.Ok(new { ready = false });
 });
 
+// 2) /claim => si está lista, devuelve el archivo license.lic como descarga
 app.MapGet("/claim", (HttpRequest req) =>
 {
     string orderId = req.Query["order_id"].ToString() ?? "";
     string email   = req.Query["email"].ToString() ?? "";
 
     if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
+    {
         return Results.BadRequest(new { error = "missing_params" });
+    }
 
-    if (!claims.TryGetValue(ClaimKey(orderId, email), out var state) || !state.Ready || string.IsNullOrEmpty(state.LicenseText))
+    if (!claims.TryGetValue(ClaimKey(orderId, email), out var state)
+        || !state.Ready
+        || string.IsNullOrEmpty(state.LicenseText))
+    {
         return Results.NotFound(new { error = "not_ready" });
+    }
 
     byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
-    string fileName = "license.lic"; // nombre final
-    return Results.File(bytes, "application/octet-stream", fileName, enableRangeProcessing: false);
+    string fileName = "license.lic"; // nombre final que el usuario va a guardar
+
+    return Results.File(
+        bytes,
+        "application/octet-stream",
+        fileName,
+        enableRangeProcessing: false
+    );
 });
 
 app.Run();
 
+
 // ================= Helpers =================
 
+// Construye y firma la licencia usando Portable.Licensing y tu clave privada
 PL.License BuildLicense(string name, string email, int weeks, int months, int days, string version, bool community)
 {
-    var lic = PL.License.New()
+    var lic = PL.License
+        .New()
         .WithUniqueIdentifier(Guid.NewGuid())
         .As(PL.LicenseType.Standard)
         .WithProductFeatures(new Dictionary<string, string> {
@@ -209,20 +290,29 @@ PL.License BuildLicense(string name, string email, int weeks, int months, int da
         })
         .LicensedTo(name, email);
 
+    // Si NO es community/free, le ponemos fecha de expiración
     if (!community)
     {
-        DateTime expires = DateTime.UtcNow.AddDays(days + weeks * 7).AddMonths(months);
+        DateTime expires = DateTime.UtcNow
+            .AddDays(days + weeks * 7)
+            .AddMonths(months);
+
         lic = lic.ExpiresAt(expires);
     }
 
+    // Firmar con nuestra private.key + passphrase
     return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
 }
 
+// helper para navegar JSON del webhook sin pelearte con niveles
 static string? Get(JsonElement root, string path)
 {
     var cur = root;
     foreach (var part in path.Split('.'))
-        if (!cur.TryGetProperty(part, out cur)) return null;
+    {
+        if (!cur.TryGetProperty(part, out cur))
+            return null;
+    }
 
     return cur.ValueKind switch
     {
@@ -234,32 +324,52 @@ static string? Get(JsonElement root, string path)
     };
 }
 
+// Validar la firma HMAC que manda Lemon Squeezy en X-Signature
 static bool VerifyHmac(string body, string secret, string headerSig)
 {
-    if (string.IsNullOrWhiteSpace(secret)) return true;   // útil en pruebas
+    // En pruebas locales puedes dejar secret vacío para que acepte todo
+    if (string.IsNullOrWhiteSpace(secret)) return true;
     if (string.IsNullOrWhiteSpace(headerSig)) return false;
 
     using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-    var hex = BitConverter.ToString(h.ComputeHash(Encoding.UTF8.GetBytes(body)))
-                         .Replace("-", "").ToLowerInvariant();
+    var hex = BitConverter
+        .ToString(h.ComputeHash(Encoding.UTF8.GetBytes(body)))
+        .Replace("-", "")
+        .ToLowerInvariant();
+
     return string.Equals(hex, headerSig, StringComparison.OrdinalIgnoreCase);
 }
 
+// Enviar correo con la licencia adjunta (opcional)
 void TrySendMail(string to, string subject, string text, PL.License lic)
 {
     if (string.IsNullOrWhiteSpace(smtpHost)) return;
+
     try
     {
         using var mm = new MailMessage(fromMail, to, subject, text);
-        mm.Attachments.Add(new Attachment(new MemoryStream(Encoding.UTF8.GetBytes(lic.ToString())), "license.lic"));
+        mm.Attachments.Add(new Attachment(
+            new MemoryStream(Encoding.UTF8.GetBytes(lic.ToString())),
+            "license.lic"
+        ));
+
         using var sc = new SmtpClient(smtpHost, smtpPort)
-        { EnableSsl = true, Credentials = new System.Net.NetworkCredential(smtpUser, smtpPass) };
+        {
+            EnableSsl = true,
+            Credentials = new System.Net.NetworkCredential(smtpUser, smtpPass)
+        };
+
         sc.Send(mm);
     }
-    catch (Exception ex) { Console.WriteLine("SMTP error: " + ex.Message); }
+    catch (Exception ex)
+    {
+        Console.WriteLine("SMTP error: " + ex.Message);
+    }
 }
 
-// ========= Tipos: al FINAL (para evitar CS8803) =========
+
+// ========= Tipos: al FINAL (para evitar CS8803 con top-level statements) =========
+
 record Claim(
     string OrderId,
     string Email,
@@ -270,12 +380,17 @@ record Claim(
     int Weeks,
     int Months,
     int Days,
-    DateTime CreatedUtc);
+    DateTime CreatedUtc
+);
 
 class ClaimState
 {
     public Claim Claim { get; init; }
     public bool Ready { get; set; }
     public string? LicenseText { get; set; }
-    public ClaimState(Claim c) { Claim = c; }
+
+    public ClaimState(Claim c)
+    {
+        Claim = c;
+    }
 }
