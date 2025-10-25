@@ -1,5 +1,5 @@
 // Program.cs  (EarthLicServer - .NET 8, Minimal API)
-// Requiere: Microsoft.NET.Sdk.Web y referencia local a libs/Portable.Licensing.dll (v1.1.0)
+// Requiere: Microsoft.NET.Sdk.Web y referencia a libs/Portable.Licensing.dll (v1.1.0)
 
 using System.Collections.Concurrent;
 using System.Net.Mail;
@@ -9,7 +9,9 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
-using PL = Portable.Licensing; // Alias para evitar conflicto con System.ComponentModel.License
+
+// Alias para evitar conflicto con System.ComponentModel.License
+using PL = Portable.Licensing;
 
 const string PRODUCT_CODE = "EARTH";
 
@@ -53,26 +55,33 @@ using var cleanupTimer = new System.Threading.Timer(_ =>
 {
     var cutoff = DateTime.UtcNow.AddHours(-12);
     foreach (var kv in claims)
-    {
         if (kv.Value.Claim.CreatedUtc < cutoff)
-        {
-            // EXPRESO el tipo para evitar el "out object"
-            claims.TryRemove(kv.Key, out ClaimState _discard);
-        }
-    }
+            claims.TryRemove(kv.Key, out ClaimState _);
 }, null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
 
 // ========== App ==========
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+// Evita cachearse respuestas dinámicas (por si algún proxy mete mano)
+app.Use(async (ctx, next) =>
+{
+    ctx.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    await next();
+});
+
 var portEnv = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 app.Urls.Add($"http://0.0.0.0:{portEnv}");
 
+// Salud / ping / wake (útiles para precalentar)
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
+app.MapGet("/ping",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
+app.MapGet("/wake",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
+
+// Raíz
 app.MapGet("/", () => "EarthLicServer OK");
 
-// -------- Licencia de prueba: 7 días ----------
+// -------- Licencia de prueba (7 días) ----------
 app.MapGet("/trial", (HttpRequest req) =>
 {
     string email = req.Query["email"].ToString();
@@ -83,7 +92,8 @@ app.MapGet("/trial", (HttpRequest req) =>
 
     var lic = BuildLicense("Trial", email, 0, 0, 7, version, community: false);
     var bytes = Encoding.UTF8.GetBytes(lic.ToString());
-    return Results.File(bytes, "text/plain", $"earth-{version}-trial.lic");
+    // Forzamos nombre license.lic para que el usuario solo mueva el archivo.
+    return Results.File(bytes, "application/octet-stream", "license.lic");
 });
 
 // -------- Webhook de Lemon: order_created ----------
@@ -91,10 +101,8 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
     string body = await new StreamReader(req.Body).ReadToEndAsync();
 
-    // toma la firma de forma segura como string (puede venir ausente)
+    // Firma HMAC
     var headerSig = req.Headers.TryGetValue("X-Signature", out var sv) ? sv.ToString() : "";
-
-    // Verifica HMAC si hay secreto cargado
     if (!VerifyHmac(body, lsSecret, headerSig))
     {
         Console.WriteLine("[Webhook] Firma inválida");
@@ -106,11 +114,10 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 
     var eventName = Get(root, "meta.event_name") ?? "";
     Console.WriteLine($"[Webhook] event = {eventName}");
-
     if (!string.Equals(eventName, "order_created", StringComparison.OrdinalIgnoreCase))
         return Results.Ok(new { ignored = eventName });
 
-    // Datos claves
+    // Datos claves del pedido
     long variantId = long.Parse(Get(root, "data.attributes.variant_id") ?? "0");
     string orderId  = Get(root, "data.id")
                       ?? Get(root, "data.attributes.order_number")
@@ -182,9 +189,8 @@ app.MapGet("/claim", (HttpRequest req) =>
         return Results.NotFound(new { error = "not_ready" });
 
     byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
-    string fileName = "license.lic";
-return Results.File(bytes, "application/octet-stream", fileName, enableRangeProcessing: false);
-
+    string fileName = "license.lic"; // nombre final
+    return Results.File(bytes, "application/octet-stream", fileName, enableRangeProcessing: false);
 });
 
 app.Run();
@@ -230,7 +236,7 @@ static string? Get(JsonElement root, string path)
 
 static bool VerifyHmac(string body, string secret, string headerSig)
 {
-    if (string.IsNullOrWhiteSpace(secret)) return true; // útil en pruebas
+    if (string.IsNullOrWhiteSpace(secret)) return true;   // útil en pruebas
     if (string.IsNullOrWhiteSpace(headerSig)) return false;
 
     using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
@@ -253,7 +259,7 @@ void TrySendMail(string to, string subject, string text, PL.License lic)
     catch (Exception ex) { Console.WriteLine("SMTP error: " + ex.Message); }
 }
 
-// ========= Tipos: al FINAL =========
+// ========= Tipos: al FINAL (para evitar CS8803) =========
 record Claim(
     string OrderId,
     string Email,
@@ -273,4 +279,3 @@ class ClaimState
     public string? LicenseText { get; set; }
     public ClaimState(Claim c) { Claim = c; }
 }
-
