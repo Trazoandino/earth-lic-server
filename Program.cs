@@ -182,13 +182,9 @@ app.MapGet("/claim", (HttpRequest req) =>
         return Results.NotFound(new { error = "not_ready" });
 
     byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
-    string fileName = $"earth-{state.Claim.Version}-{state.Claim.Email.Replace("@","_")}.lic";
+    string fileName = "license.lic";
+return Results.File(bytes, "application/octet-stream", fileName, enableRangeProcessing: false);
 
-    return Results.File(
-        fileContents: bytes,
-        contentType: "application/octet-stream",
-        fileDownloadName: fileName,
-        enableRangeProcessing: false);
 });
 
 app.Run();
@@ -277,3 +273,4 @@ class ClaimState
     public string? LicenseText { get; set; }
     public ClaimState(Claim c) { Claim = c; }
 }
+
