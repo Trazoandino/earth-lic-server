@@ -108,6 +108,47 @@ app.Urls.Add($"http://0.0.0.0:{portEnv}");
 // ---------- ENDPOINTS -----------
 //
 
+// --- emitir licencia ad-hoc en minutos (solo admin) ---
+app.MapGet("/dev/lic", (HttpRequest req) =>
+{
+    var token = req.Query["token"].ToString();
+    if (token != Environment.GetEnvironmentVariable("ADMIN_TOKEN"))
+        return Results.Unauthorized();
+
+    string email   = string.IsNullOrWhiteSpace(req.Query["email"])   ? "dev@user" : req.Query["email"].ToString();
+    string version = string.IsNullOrWhiteSpace(req.Query["version"]) ? "2025"     : req.Query["version"].ToString();
+
+    // por seguridad limitamos a 120 min máx.
+    int minutes = 2;
+    if (int.TryParse(req.Query["minutes"], out var m) && m > 0 && m <= 120) minutes = m;
+
+    var lic = BuildLicenseMinutes("Dev Flash", email, minutes, version, community: false);
+    var bytes = Encoding.UTF8.GetBytes(lic.ToString());
+    return Results.File(bytes, "application/octet-stream", "license.lic");
+});
+
+// Overload para minutos (reusa privatePem/privatePass ya cargados arriba)
+PL.License BuildLicenseMinutes(string name, string email, int minutes, string version, bool community)
+{
+    var lic = PL.License
+        .New()
+        .WithUniqueIdentifier(Guid.NewGuid())
+        .As(PL.LicenseType.Standard)
+        .WithProductFeatures(new Dictionary<string, string> {
+            { "Apps", PRODUCT_CODE },      // p.ej. EARTH
+            { "Version", version },
+            { "Community", community ? "true" : "false" }
+        })
+        .LicensedTo(name, email);
+
+    if (!community)
+        lic = lic.ExpiresAt(DateTime.UtcNow.AddMinutes(minutes));
+
+    return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
+}
+
+
+
 // Salud / ping / wake (útiles para testear y también para "despertar" la instancia desde gracias.html)
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
 app.MapGet("/ping",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
@@ -271,6 +312,8 @@ app.MapGet("/claim", (HttpRequest req) =>
     );
 });
 
+
+
 app.Run();
 
 
@@ -394,3 +437,4 @@ class ClaimState
         Claim = c;
     }
 }
+
