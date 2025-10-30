@@ -19,9 +19,13 @@ const string PRODUCT_CODE = "EARTH";
 
 // ================== Config / secretos ==================
 
-// Clave privada para firmar licencias
+// Clave privada para firmar licencias.
+// Preferimos PRIVATE_KEY_PEM en entorno (Render); como fallback, PRIVATE_KEY_PATH o "private.key".
 string? pem = Environment.GetEnvironmentVariable("PRIVATE_KEY_PEM");
-string privatePem = pem ?? File.ReadAllText(Environment.GetEnvironmentVariable("PRIVATE_KEY_PATH") ?? "private.key");
+string privatePem = !string.IsNullOrWhiteSpace(pem)
+    ? pem!
+    : File.ReadAllText(Environment.GetEnvironmentVariable("PRIVATE_KEY_PATH") ?? "private.key");
+
 string privatePass = Environment.GetEnvironmentVariable("PRIVATE_KEY_PASS") ?? "change-me";
 
 // Webhook secret de Lemon (Settings → Webhooks)
@@ -54,12 +58,10 @@ var map = new Dictionary<long, (int weeks, int months, string version, bool comm
 };
 
 // ========== Store en memoria para “claims” ==========
-// Vamos a guardar temporalmente la licencia generada para cada compra,
-// indexada por orderId + email. Así la página gracias.html puede pedirla.
 var claims = new ConcurrentDictionary<string, ClaimState>();
 static string ClaimKey(string orderId, string email) => $"{orderId}::{email}".ToLowerInvariant();
 
-// Limpieza básica (evita que se acumule memoria a lo loco)
+// Limpieza básica de claims (cada 30 min elimina >12h)
 using var cleanupTimer = new System.Threading.Timer(_ =>
 {
     var cutoff = DateTime.UtcNow.AddHours(-12);
@@ -75,14 +77,11 @@ using var cleanupTimer = new System.Threading.Timer(_ =>
 var builder = WebApplication.CreateBuilder(args);
 
 // ---- CORS ----
-// Permitimos que la página gracias.html (hosteada en GitHub Pages) pueda hacer
-// fetch(...) al servidor en Render. Durante pruebas dejamos AllowAnyOrigin.
-// En producción puedes restringir con .WithOrigins("https://trazoandino.github.io")
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
         policy
-            .AllowAnyOrigin()
+            .AllowAnyOrigin()  // en prod puedes restringir: .WithOrigins("https://trazoandino.github.io")
             .AllowAnyHeader()
             .AllowAnyMethod()
     );
@@ -93,7 +92,7 @@ var app = builder.Build();
 // habilita CORS
 app.UseCors();
 
-// Evita cachearse respuestas dinámicas (por si algún proxy mete mano)
+// Evita cachearse respuestas dinámicas
 app.Use(async (ctx, next) =>
 {
     ctx.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
@@ -108,17 +107,33 @@ app.Urls.Add($"http://0.0.0.0:{portEnv}");
 // ---------- ENDPOINTS -----------
 //
 
-// --- emitir licencia ad-hoc en minutos (solo admin) ---
+// ===== Helpers de auth admin (const-time) =====
+static bool IsAdmin(HttpRequest req)
+{
+    // token por query o por header
+    string token = req.Query["token"];
+    if (string.IsNullOrEmpty(token))
+        token = req.Headers["x-admin-token"];
+
+    string env = Environment.GetEnvironmentVariable("ADMIN_TOKEN") ?? string.Empty;
+    if (string.IsNullOrEmpty(env) || string.IsNullOrEmpty(token)) return false;
+
+    var a = Encoding.UTF8.GetBytes(env);
+    var b = Encoding.UTF8.GetBytes(token);
+    if (a.Length != b.Length) return false;
+    return CryptographicOperations.FixedTimeEquals(a, b);
+}
+
+// --- DEV: emitir licencia ad-hoc en minutos (solo admin) ---
 app.MapGet("/dev/lic", (HttpRequest req) =>
 {
-    var token = req.Query["token"].ToString();
-    if (token != Environment.GetEnvironmentVariable("ADMIN_TOKEN"))
+    if (!IsAdmin(req))
         return Results.Unauthorized();
 
     string email   = string.IsNullOrWhiteSpace(req.Query["email"])   ? "dev@user" : req.Query["email"].ToString();
     string version = string.IsNullOrWhiteSpace(req.Query["version"]) ? "2025"     : req.Query["version"].ToString();
 
-    // por seguridad limitamos a 120 min máx.
+    // límite de seguridad (máx 120 min)
     int minutes = 2;
     if (int.TryParse(req.Query["minutes"], out var m) && m > 0 && m <= 120) minutes = m;
 
@@ -127,38 +142,22 @@ app.MapGet("/dev/lic", (HttpRequest req) =>
     return Results.File(bytes, "application/octet-stream", "license.lic");
 });
 
-// Overload para minutos (reusa privatePem/privatePass ya cargados arriba)
-PL.License BuildLicenseMinutes(string name, string email, int minutes, string version, bool community)
+// (Opcional) Debug: confirma si ADMIN_TOKEN está definido (no revela el valor)
+app.MapGet("/dev/debug/admin-token", () =>
 {
-    var lic = PL.License
-        .New()
-        .WithUniqueIdentifier(Guid.NewGuid())
-        .As(PL.LicenseType.Standard)
-        .WithProductFeatures(new Dictionary<string, string> {
-            { "Apps", PRODUCT_CODE },      // p.ej. EARTH
-            { "Version", version },
-            { "Community", community ? "true" : "false" }
-        })
-        .LicensedTo(name, email);
+    var val = Environment.GetEnvironmentVariable("ADMIN_TOKEN");
+    return Results.Ok(new { hasAdminToken = !string.IsNullOrEmpty(val), length = val?.Length ?? 0 });
+});
 
-    if (!community)
-        lic = lic.ExpiresAt(DateTime.UtcNow.AddMinutes(minutes));
-
-    return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
-}
-
-
-
-// Salud / ping / wake (útiles para testear y también para "despertar" la instancia desde gracias.html)
+// Salud / ping / wake
 app.MapGet("/healthz", () => Results.Ok(new { ok = true }));
 app.MapGet("/ping",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
 app.MapGet("/wake",     () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
 
-// Raíz (para ver que está vivo)
+// Raíz
 app.MapGet("/", () => "EarthLicServer OK");
 
 // -------- Licencia de prueba (7 días) ----------
-// (Esta ruta es útil para debug / modo demo. El trial siempre expira en 7 días)
 app.MapGet("/trial", (HttpRequest req) =>
 {
     string email = req.Query["email"].ToString();
@@ -169,15 +168,10 @@ app.MapGet("/trial", (HttpRequest req) =>
 
     var lic = BuildLicense("Trial", email, 0, 0, 7, version, community: false);
     var bytes = Encoding.UTF8.GetBytes(lic.ToString());
-
-    // Forzamos nombre license.lic para que el usuario solo mueva el archivo.
     return Results.File(bytes, "application/octet-stream", "license.lic");
 });
 
 // -------- Webhook de Lemon Squeezy: order_created ----------
-// Lemon Squeezy nos va a POSTear aquí cuando haya una orden nueva.
-// Nosotros generamos la licencia y la guardamos en memoria para que
-// gracias.html la pueda bajar.
 app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 {
     string body = await new StreamReader(req.Body).ReadToEndAsync();
@@ -264,6 +258,7 @@ app.MapPost("/webhooks/lemonsqueezy", async (HttpRequest req) =>
 });
 
 // -------- Polling desde gracias.html --------
+
 // 1) /claim/status => para saber si la licencia ya está lista
 app.MapGet("/claim/status", (HttpRequest req) =>
 {
@@ -271,14 +266,10 @@ app.MapGet("/claim/status", (HttpRequest req) =>
     string email   = req.Query["email"].ToString() ?? "";
 
     if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
-    {
         return Results.BadRequest(new { ready = false, error = "missing_params" });
-    }
 
     if (claims.TryGetValue(ClaimKey(orderId, email), out var state))
-    {
         return Results.Ok(new { ready = state.Ready });
-    }
 
     return Results.Ok(new { ready = false });
 });
@@ -290,16 +281,12 @@ app.MapGet("/claim", (HttpRequest req) =>
     string email   = req.Query["email"].ToString() ?? "";
 
     if (string.IsNullOrWhiteSpace(orderId) || string.IsNullOrWhiteSpace(email))
-    {
         return Results.BadRequest(new { error = "missing_params" });
-    }
 
     if (!claims.TryGetValue(ClaimKey(orderId, email), out var state)
         || !state.Ready
         || string.IsNullOrEmpty(state.LicenseText))
-    {
         return Results.NotFound(new { error = "not_ready" });
-    }
 
     byte[] bytes = Encoding.UTF8.GetBytes(state.LicenseText);
     string fileName = "license.lic"; // nombre final que el usuario va a guardar
@@ -311,8 +298,6 @@ app.MapGet("/claim", (HttpRequest req) =>
         enableRangeProcessing: false
     );
 });
-
-
 
 app.Run();
 
@@ -347,7 +332,27 @@ PL.License BuildLicense(string name, string email, int weeks, int months, int da
     return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
 }
 
-// helper para navegar JSON del webhook sin pelearte con niveles
+// Overload para minutos (para /dev/lic)
+PL.License BuildLicenseMinutes(string name, string email, int minutes, string version, bool community)
+{
+    var lic = PL.License
+        .New()
+        .WithUniqueIdentifier(Guid.NewGuid())
+        .As(PL.LicenseType.Standard)
+        .WithProductFeatures(new Dictionary<string, string> {
+            { "Apps", PRODUCT_CODE },
+            { "Version", version },
+            { "Community", community ? "true" : "false" }
+        })
+        .LicensedTo(name, email);
+
+    if (!community)
+        lic = lic.ExpiresAt(DateTime.UtcNow.AddMinutes(minutes));
+
+    return lic.CreateAndSignWithPrivateKey(privatePem, privatePass);
+}
+
+// helper para navegar JSON del webhook sin pelearse con niveles
 static string? Get(JsonElement root, string path)
 {
     var cur = root;
@@ -437,4 +442,3 @@ class ClaimState
         Claim = c;
     }
 }
-
